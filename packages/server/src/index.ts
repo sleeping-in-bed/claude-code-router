@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { existsSync } from "fs";
 import { writeFile } from "fs/promises";
 import { homedir } from "os";
@@ -53,6 +54,287 @@ interface PluginConfig {
   options?: Record<string, any>;
 }
 
+type PromptCacheTTL = "5m" | "1h";
+
+interface PromptCacheEntry {
+  key: string;
+  ttlType: PromptCacheTTL;
+  prefixTokens: number;
+  createdAt: number;
+  expiresAt: number;
+}
+
+interface PromptCacheDescriptor {
+  cacheKey: string;
+  prefixHash: string;
+  prefixRequest: Record<string, any>;
+  ttlType: PromptCacheTTL;
+}
+
+interface PromptCacheSnapshot {
+  request: Record<string, any>;
+  ttlType: PromptCacheTTL;
+}
+
+interface PromptCacheUsage {
+  inputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreation5mTokens: number;
+  cacheCreation1hTokens: number;
+  shouldStore: boolean;
+  stored: boolean;
+  descriptor?: PromptCacheDescriptor;
+}
+
+const PROMPT_CACHE_TTL_MS: Record<PromptCacheTTL, number> = {
+  "5m": 5 * 60 * 1000,
+  "1h": 60 * 60 * 1000,
+};
+
+const promptCacheStore = new Map<string, PromptCacheEntry>();
+
+function cloneJSON<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function parsePromptCacheTTL(cacheControl: any): PromptCacheTTL {
+  if (!cacheControl || typeof cacheControl !== "object") {
+    return "5m";
+  }
+
+  const raw = [
+    cacheControl.ttl,
+    cacheControl.cache_ttl,
+    cacheControl.duration,
+    cacheControl.type,
+    cacheControl.mode,
+    cacheControl.name,
+  ]
+    .filter((item) => typeof item === "string" || typeof item === "number")
+    .join(" ")
+    .toLowerCase();
+
+  if (
+    raw.includes("1h") ||
+    raw.includes("1 hour") ||
+    raw.includes("1hour") ||
+    raw.includes("60m") ||
+    raw.includes("3600")
+  ) {
+    return "1h";
+  }
+
+  return "5m";
+}
+
+function hasCacheControl(value: any): boolean {
+  return Boolean(value && typeof value === "object" && value.cache_control);
+}
+
+function buildPromptCachePrefix(requestBody: any): PromptCacheDescriptor | null {
+  if (!requestBody || typeof requestBody !== "object") {
+    return null;
+  }
+
+  const prefixRequest: Record<string, any> = {
+    messages: [],
+  };
+
+  let latestSnapshot: PromptCacheSnapshot | null = null;
+
+  const captureSnapshot = (cacheControl: any) => {
+    latestSnapshot = {
+      request: cloneJSON(prefixRequest),
+      ttlType: parsePromptCacheTTL(cacheControl),
+    };
+  };
+
+  if (typeof requestBody.system === "string" && requestBody.system.length > 0) {
+    prefixRequest.system = requestBody.system;
+  } else if (Array.isArray(requestBody.system) && requestBody.system.length > 0) {
+    prefixRequest.system = [];
+    for (const block of requestBody.system) {
+      prefixRequest.system.push(cloneJSON(block));
+      if (hasCacheControl(block)) {
+        captureSnapshot(block.cache_control);
+      }
+    }
+  }
+
+  for (const message of requestBody.messages || []) {
+    const clonedMessage = cloneJSON({
+      role: message.role,
+      content: typeof message.content === "string" ? message.content : [],
+    });
+    prefixRequest.messages.push(clonedMessage);
+
+    if (hasCacheControl(message)) {
+      captureSnapshot(message.cache_control);
+    }
+
+    if (typeof message.content === "string") {
+      continue;
+    }
+
+    if (!Array.isArray(message.content)) {
+      clonedMessage.content = message.content;
+      continue;
+    }
+
+    clonedMessage.content = [];
+    for (const part of message.content) {
+      clonedMessage.content.push(cloneJSON(part));
+      if (hasCacheControl(part)) {
+        captureSnapshot(part.cache_control);
+      }
+    }
+  }
+
+  if (!latestSnapshot) {
+    return null;
+  }
+
+  const snapshot = latestSnapshot as PromptCacheSnapshot;
+
+  const normalized = JSON.stringify(snapshot.request);
+  const prefixHash = createHash("sha256").update(normalized).digest("hex");
+  const modelName = String(requestBody.model || "");
+  const cacheKey = [
+    "prompt-cache",
+    modelName,
+    snapshot.ttlType,
+    prefixHash,
+  ].join(":");
+
+  return {
+    cacheKey,
+    prefixHash,
+    prefixRequest: snapshot.request,
+    ttlType: snapshot.ttlType,
+  };
+}
+
+function getPromptCacheEntry(cacheKey: string): PromptCacheEntry | null {
+  const existing = promptCacheStore.get(cacheKey);
+  if (!existing) {
+    return null;
+  }
+
+  if (existing.expiresAt <= Date.now()) {
+    promptCacheStore.delete(cacheKey);
+    return null;
+  }
+
+  return existing;
+}
+
+function storePromptCacheEntry(descriptor: PromptCacheDescriptor, prefixTokens: number): PromptCacheEntry {
+  const now = Date.now();
+  const entry: PromptCacheEntry = {
+    key: descriptor.cacheKey,
+    ttlType: descriptor.ttlType,
+    prefixTokens,
+    createdAt: now,
+    expiresAt: now + PROMPT_CACHE_TTL_MS[descriptor.ttlType],
+  };
+  promptCacheStore.set(descriptor.cacheKey, entry);
+  return entry;
+}
+
+function buildPromptCacheUsage(inputTokens: number, cacheUsage: PromptCacheUsage) {
+  const usage: Record<string, any> = {
+    input_tokens: Math.max(0, Math.round(inputTokens)),
+    output_tokens: 0,
+    cache_creation_input_tokens: Math.max(0, Math.round(cacheUsage.cacheCreationInputTokens)),
+    cache_read_input_tokens: Math.max(0, Math.round(cacheUsage.cacheReadInputTokens)),
+  };
+
+  if (cacheUsage.cacheCreation5mTokens > 0 || cacheUsage.cacheCreation1hTokens > 0) {
+    usage.cache_creation = {
+      ephemeral_5m_input_tokens: Math.max(0, Math.round(cacheUsage.cacheCreation5mTokens)),
+      ephemeral_1h_input_tokens: Math.max(0, Math.round(cacheUsage.cacheCreation1hTokens)),
+    };
+  }
+
+  return usage;
+}
+
+async function resolvePromptCacheUsage(
+  serverInstance: any,
+  req: any,
+  totalInputTokens: number,
+): Promise<PromptCacheUsage> {
+  const descriptor = buildPromptCachePrefix(req.body);
+  if (!descriptor) {
+    return {
+      inputTokens: Math.max(0, totalInputTokens),
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheCreation5mTokens: 0,
+      cacheCreation1hTokens: 0,
+      shouldStore: false,
+      stored: false,
+    };
+  }
+
+  const prefixTokens = Math.min(
+    totalInputTokens,
+    await countAnthropicTokens(serverInstance, req, {
+      messages: descriptor.prefixRequest.messages || [],
+      system: descriptor.prefixRequest.system,
+    }),
+  );
+
+  if (prefixTokens <= 0) {
+    return {
+      inputTokens: Math.max(0, totalInputTokens),
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheCreation5mTokens: 0,
+      cacheCreation1hTokens: 0,
+      shouldStore: false,
+      stored: false,
+    };
+  }
+
+  const existing = getPromptCacheEntry(descriptor.cacheKey);
+  const nonCachedInputTokens = Math.max(0, totalInputTokens - prefixTokens);
+
+  if (existing) {
+    return {
+      inputTokens: nonCachedInputTokens,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: prefixTokens,
+      cacheCreation5mTokens: 0,
+      cacheCreation1hTokens: 0,
+      shouldStore: false,
+      stored: true,
+      descriptor,
+    };
+  }
+
+  return {
+    inputTokens: nonCachedInputTokens,
+    cacheCreationInputTokens: prefixTokens,
+    cacheReadInputTokens: 0,
+    cacheCreation5mTokens: descriptor.ttlType === "5m" ? prefixTokens : 0,
+    cacheCreation1hTokens: descriptor.ttlType === "1h" ? prefixTokens : 0,
+    shouldStore: true,
+    stored: false,
+    descriptor,
+  };
+}
+
+function ensurePromptCacheStored(cacheUsage: PromptCacheUsage) {
+  if (!cacheUsage.shouldStore || cacheUsage.stored || !cacheUsage.descriptor) {
+    return;
+  }
+
+  storePromptCacheEntry(cacheUsage.descriptor, cacheUsage.cacheCreationInputTokens);
+  cacheUsage.stored = true;
+}
+
 function hasAnthropicUsage(usage: any): boolean {
   if (!usage || typeof usage !== "object") {
     return false;
@@ -61,16 +343,23 @@ function hasAnthropicUsage(usage: any): boolean {
   return (
     Number(usage.input_tokens || 0) > 0 ||
     Number(usage.output_tokens || 0) > 0 ||
+    Number(usage.cache_creation_input_tokens || 0) > 0 ||
     Number(usage.cache_read_input_tokens || 0) > 0
   );
 }
 
-function buildAnthropicUsage(inputTokens: number, outputTokens: number) {
-  return {
-    input_tokens: Math.max(0, Math.round(inputTokens)),
-    output_tokens: Math.max(0, Math.round(outputTokens)),
-    cache_read_input_tokens: 0,
-  };
+function buildAnthropicUsage(inputTokens: number, outputTokens: number, cacheUsage?: PromptCacheUsage) {
+  const usage = buildPromptCacheUsage(inputTokens, cacheUsage || {
+    inputTokens,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreation5mTokens: 0,
+    cacheCreation1hTokens: 0,
+    shouldStore: false,
+    stored: false,
+  });
+  usage.output_tokens = Math.max(0, Math.round(outputTokens));
+  return usage;
 }
 
 function extractAnthropicStreamText(eventData: any): string {
@@ -513,15 +802,30 @@ async function getServer(options: RunOptions = {}) {
       return payload;
     }
 
-    if (!(payload instanceof ReadableStream)) {
-      return payload;
-    }
-
-    const inputTokensPromise = countAnthropicTokens(serverInstance, req, {
+    const totalInputTokensPromise = countAnthropicTokens(serverInstance, req, {
       messages: req.body?.messages || [],
       system: req.body?.system,
       tools: req.body?.tools,
     });
+    const promptCacheUsagePromise = totalInputTokensPromise.then((totalInputTokens) =>
+      resolvePromptCacheUsage(serverInstance, req, totalInputTokens),
+    );
+
+    if (!(payload instanceof ReadableStream)) {
+      if (payload && typeof payload === "object" && !payload.error) {
+        const promptCacheUsage = await promptCacheUsagePromise;
+        if (!hasAnthropicUsage(payload.usage)) {
+          ensurePromptCacheStored(promptCacheUsage);
+          payload.usage = buildAnthropicUsage(
+            promptCacheUsage.inputTokens,
+            Number(payload.usage?.output_tokens || 0),
+            promptCacheUsage,
+          );
+        }
+      }
+      return payload;
+    }
+
     let completionText = "";
     let usagePatched = false;
 
@@ -532,9 +836,20 @@ async function getServer(options: RunOptions = {}) {
       async (eventData, controller) => {
         completionText += extractAnthropicStreamText(eventData);
 
+        if (eventData?.event === "message_start") {
+          const promptCacheUsage = await promptCacheUsagePromise;
+          ensurePromptCacheStored(promptCacheUsage);
+          const originalUsage = eventData?.data?.message?.usage || {};
+          eventData.data.message.usage = {
+            ...buildAnthropicUsage(promptCacheUsage.inputTokens, 0, promptCacheUsage),
+            output_tokens: Number(originalUsage.output_tokens || 0),
+          };
+          return eventData;
+        }
+
         if (eventData?.event === "message_delta") {
           if (!hasAnthropicUsage(eventData?.data?.usage)) {
-            const inputTokens = await inputTokensPromise;
+            const promptCacheUsage = await promptCacheUsagePromise;
             const outputTokens = await countAnthropicTokens(serverInstance, req, {
               messages: [
                 {
@@ -544,12 +859,17 @@ async function getServer(options: RunOptions = {}) {
               ],
             });
 
+            ensurePromptCacheStored(promptCacheUsage);
             usagePatched = true;
             return {
               ...eventData,
               data: {
                 ...eventData.data,
-                usage: buildAnthropicUsage(inputTokens, outputTokens),
+                usage: buildAnthropicUsage(
+                  promptCacheUsage.inputTokens,
+                  outputTokens,
+                  promptCacheUsage,
+                ),
               },
             };
           }
@@ -559,7 +879,7 @@ async function getServer(options: RunOptions = {}) {
         }
 
         if (eventData?.event === "message_stop" && !usagePatched) {
-          const inputTokens = await inputTokensPromise;
+          const promptCacheUsage = await promptCacheUsagePromise;
           const outputTokens = await countAnthropicTokens(serverInstance, req, {
             messages: [
               {
@@ -569,6 +889,7 @@ async function getServer(options: RunOptions = {}) {
             ],
           });
 
+          ensurePromptCacheStored(promptCacheUsage);
           (controller as any).enqueue({
             event: "message_delta",
             data: {
@@ -577,7 +898,11 @@ async function getServer(options: RunOptions = {}) {
                 stop_reason: "end_turn",
                 stop_sequence: null,
               },
-              usage: buildAnthropicUsage(inputTokens, outputTokens),
+              usage: buildAnthropicUsage(
+                promptCacheUsage.inputTokens,
+                outputTokens,
+                promptCacheUsage,
+              ),
             },
           });
           usagePatched = true;
