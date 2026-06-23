@@ -76,6 +76,10 @@ interface PromptCacheSnapshot {
   ttlType: PromptCacheTTL;
 }
 
+interface PromptCacheCandidate extends PromptCacheDescriptor {
+  snapshotIndex: number;
+}
+
 interface PromptCacheUsage {
   inputTokens: number;
   cacheCreationInputTokens: number;
@@ -132,22 +136,22 @@ function hasCacheControl(value: any): boolean {
   return Boolean(value && typeof value === "object" && value.cache_control);
 }
 
-function buildPromptCachePrefix(requestBody: any): PromptCacheDescriptor | null {
+function buildPromptCacheCandidates(requestBody: any): PromptCacheCandidate[] {
   if (!requestBody || typeof requestBody !== "object") {
-    return null;
+    return [];
   }
 
   const prefixRequest: Record<string, any> = {
     messages: [],
   };
 
-  let latestSnapshot: PromptCacheSnapshot | null = null;
+  const snapshots: PromptCacheSnapshot[] = [];
 
   const captureSnapshot = (cacheControl: any) => {
-    latestSnapshot = {
+    snapshots.push({
       request: cloneJSON(prefixRequest),
       ttlType: parsePromptCacheTTL(cacheControl),
-    };
+    });
   };
 
   if (typeof requestBody.system === "string" && requestBody.system.length > 0) {
@@ -191,28 +195,29 @@ function buildPromptCachePrefix(requestBody: any): PromptCacheDescriptor | null 
     }
   }
 
-  if (!latestSnapshot) {
-    return null;
+  if (snapshots.length === 0) {
+    return [];
   }
 
-  const snapshot = latestSnapshot as PromptCacheSnapshot;
-
-  const normalized = JSON.stringify(snapshot.request);
-  const prefixHash = createHash("sha256").update(normalized).digest("hex");
   const modelName = String(requestBody.model || "");
-  const cacheKey = [
-    "prompt-cache",
-    modelName,
-    snapshot.ttlType,
-    prefixHash,
-  ].join(":");
+  return snapshots.map((snapshot, index) => {
+    const normalized = JSON.stringify(snapshot.request);
+    const prefixHash = createHash("sha256").update(normalized).digest("hex");
+    const cacheKey = [
+      "prompt-cache",
+      modelName,
+      snapshot.ttlType,
+      prefixHash,
+    ].join(":");
 
-  return {
-    cacheKey,
-    prefixHash,
-    prefixRequest: snapshot.request,
-    ttlType: snapshot.ttlType,
-  };
+    return {
+      cacheKey,
+      prefixHash,
+      prefixRequest: snapshot.request,
+      ttlType: snapshot.ttlType,
+      snapshotIndex: index,
+    };
+  });
 }
 
 function getPromptCacheEntry(cacheKey: string): PromptCacheEntry | null {
@@ -265,8 +270,8 @@ async function resolvePromptCacheUsage(
   req: any,
   totalInputTokens: number,
 ): Promise<PromptCacheUsage> {
-  const descriptor = buildPromptCachePrefix(req.body);
-  if (!descriptor) {
+  const candidates = buildPromptCacheCandidates(req.body);
+  if (candidates.length === 0) {
     return {
       inputTokens: Math.max(0, totalInputTokens),
       cacheCreationInputTokens: 0,
@@ -278,13 +283,26 @@ async function resolvePromptCacheUsage(
     };
   }
 
-  const prefixTokens = Math.min(
-    totalInputTokens,
-    await countAnthropicTokens(serverInstance, req, {
-      messages: descriptor.prefixRequest.messages || [],
-      system: descriptor.prefixRequest.system,
+  const tokenizedCandidates = await Promise.all(
+    candidates.map(async (candidate) => {
+      const prefixTokens = Math.min(
+        totalInputTokens,
+        await countAnthropicTokens(serverInstance, req, {
+          messages: candidate.prefixRequest.messages || [],
+          system: candidate.prefixRequest.system,
+        }),
+      );
+      return {
+        candidate,
+        prefixTokens,
+        existing: getPromptCacheEntry(candidate.cacheKey),
+      };
     }),
   );
+
+  const finalCandidate = tokenizedCandidates[tokenizedCandidates.length - 1];
+  const descriptor = finalCandidate.candidate;
+  const prefixTokens = finalCandidate.prefixTokens;
 
   if (prefixTokens <= 0) {
     return {
@@ -298,10 +316,14 @@ async function resolvePromptCacheUsage(
     };
   }
 
-  const existing = getPromptCacheEntry(descriptor.cacheKey);
+  const bestReusableCandidate = tokenizedCandidates
+    .filter((item) => item.existing && item.prefixTokens > 0)
+    .sort((left, right) => right.prefixTokens - left.prefixTokens)[0];
+  const reusablePrefixTokens = bestReusableCandidate?.prefixTokens || 0;
   const nonCachedInputTokens = Math.max(0, totalInputTokens - prefixTokens);
+  const cacheCreationInputTokens = Math.max(0, prefixTokens - reusablePrefixTokens);
 
-  if (existing) {
+  if (bestReusableCandidate && reusablePrefixTokens >= prefixTokens) {
     return {
       inputTokens: nonCachedInputTokens,
       cacheCreationInputTokens: 0,
@@ -316,10 +338,10 @@ async function resolvePromptCacheUsage(
 
   return {
     inputTokens: nonCachedInputTokens,
-    cacheCreationInputTokens: prefixTokens,
-    cacheReadInputTokens: 0,
-    cacheCreation5mTokens: descriptor.ttlType === "5m" ? prefixTokens : 0,
-    cacheCreation1hTokens: descriptor.ttlType === "1h" ? prefixTokens : 0,
+    cacheCreationInputTokens,
+    cacheReadInputTokens: reusablePrefixTokens,
+    cacheCreation5mTokens: descriptor.ttlType === "5m" ? cacheCreationInputTokens : 0,
+    cacheCreation1hTokens: descriptor.ttlType === "1h" ? cacheCreationInputTokens : 0,
     shouldStore: true,
     stored: false,
     descriptor,
