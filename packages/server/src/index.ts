@@ -15,7 +15,7 @@ import JSON5 from "json5";
 import { IAgent, ITool } from "./agents/type";
 import agentsManager from "./agents";
 import { EventEmitter } from "node:events";
-import { pluginManager, tokenSpeedPlugin } from "@musistudio/llms";
+import { calculateTokenCount, pluginManager, tokenSpeedPlugin } from "@musistudio/llms";
 
 const event = new EventEmitter()
 
@@ -51,6 +51,95 @@ interface PluginConfig {
   name: string;
   enabled?: boolean;
   options?: Record<string, any>;
+}
+
+function hasAnthropicUsage(usage: any): boolean {
+  if (!usage || typeof usage !== "object") {
+    return false;
+  }
+
+  return (
+    Number(usage.input_tokens || 0) > 0 ||
+    Number(usage.output_tokens || 0) > 0 ||
+    Number(usage.cache_read_input_tokens || 0) > 0
+  );
+}
+
+function buildAnthropicUsage(inputTokens: number, outputTokens: number) {
+  return {
+    input_tokens: Math.max(0, Math.round(inputTokens)),
+    output_tokens: Math.max(0, Math.round(outputTokens)),
+    cache_read_input_tokens: 0,
+  };
+}
+
+function extractAnthropicStreamText(eventData: any): string {
+  if (eventData?.event === "content_block_start") {
+    if (eventData?.data?.content_block?.type === "tool_use") {
+      return eventData.data.content_block.name || "";
+    }
+    return "";
+  }
+
+  if (eventData?.event !== "content_block_delta") {
+    return "";
+  }
+
+  const delta = eventData?.data?.delta;
+  if (!delta) {
+    return "";
+  }
+
+  if (delta.type === "text_delta") {
+    return delta.text || "";
+  }
+
+  if (delta.type === "thinking_delta") {
+    return delta.thinking || "";
+  }
+
+  if (delta.type === "input_json_delta") {
+    return delta.partial_json || "";
+  }
+
+  return "";
+}
+
+async function countAnthropicTokens(
+  serverInstance: any,
+  req: any,
+  tokenRequest: any,
+): Promise<number> {
+  const tokenizerService = serverInstance?.app?._server?.tokenizerService;
+  const providerName = req.provider;
+  const modelName = req.body?.model;
+
+  if (tokenizerService && providerName && modelName) {
+    try {
+      const tokenizerConfig = tokenizerService.getTokenizerConfigForModel(
+        providerName,
+        modelName,
+      );
+      const result = await tokenizerService.countTokens(
+        tokenRequest,
+        tokenizerConfig,
+      );
+      return Math.max(0, Math.round(result?.tokenCount || 0));
+    } catch (error) {
+      req.log?.warn({ error }, "failed to count tokens with tokenizer service");
+    }
+  }
+
+  return Math.max(
+    0,
+    Math.round(
+      calculateTokenCount(
+        tokenRequest.messages || [],
+        tokenRequest.system,
+        tokenRequest.tools,
+      ),
+    ),
+  );
 }
 
 /**
@@ -418,6 +507,88 @@ async function getServer(options: RunOptions = {}) {
       return done(payload.error, null)
     }
     done(null, payload)
+  });
+  serverInstance.addHook("onSend", async (req: any, reply: any, payload: any) => {
+    if (!req.pathname?.endsWith("/v1/messages")) {
+      return payload;
+    }
+
+    if (!(payload instanceof ReadableStream)) {
+      return payload;
+    }
+
+    const inputTokensPromise = countAnthropicTokens(serverInstance, req, {
+      messages: req.body?.messages || [],
+      system: req.body?.system,
+      tools: req.body?.tools,
+    });
+    let completionText = "";
+    let usagePatched = false;
+
+    return rewriteStream(
+      payload
+        .pipeThrough(new TextDecoderStream())
+        .pipeThrough(new SSEParserTransform() as any),
+      async (eventData, controller) => {
+        completionText += extractAnthropicStreamText(eventData);
+
+        if (eventData?.event === "message_delta") {
+          if (!hasAnthropicUsage(eventData?.data?.usage)) {
+            const inputTokens = await inputTokensPromise;
+            const outputTokens = await countAnthropicTokens(serverInstance, req, {
+              messages: [
+                {
+                  role: "assistant",
+                  content: completionText,
+                },
+              ],
+            });
+
+            usagePatched = true;
+            return {
+              ...eventData,
+              data: {
+                ...eventData.data,
+                usage: buildAnthropicUsage(inputTokens, outputTokens),
+              },
+            };
+          }
+
+          usagePatched = true;
+          return eventData;
+        }
+
+        if (eventData?.event === "message_stop" && !usagePatched) {
+          const inputTokens = await inputTokensPromise;
+          const outputTokens = await countAnthropicTokens(serverInstance, req, {
+            messages: [
+              {
+                role: "assistant",
+                content: completionText,
+              },
+            ],
+          });
+
+          (controller as any).enqueue({
+            event: "message_delta",
+            data: {
+              type: "message_delta",
+              delta: {
+                stop_reason: "end_turn",
+                stop_sequence: null,
+              },
+              usage: buildAnthropicUsage(inputTokens, outputTokens),
+            },
+          });
+          usagePatched = true;
+          return eventData;
+        }
+
+        return eventData;
+      },
+    )
+      .pipeThrough(new SSESerializerTransform() as any)
+      .pipeThrough(new TextEncoderStream());
   });
   serverInstance.addHook("onSend", async (req: any, reply: any, payload: any) => {
     event.emit('onSend', req, reply, payload);
