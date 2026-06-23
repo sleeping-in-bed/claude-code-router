@@ -6,7 +6,7 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 
 # 安装 pnpm
-RUN npm install -g pnpm@latest && \
+RUN npm install -g pnpm@9.15.9 && \
     rm -rf /root/.npm
 
 # 复制工作区配置文件
@@ -17,7 +17,7 @@ COPY packages/core/package.json ./packages/core/
 COPY packages/server/package.json ./packages/server/
 
 # 安装所有依赖（包括开发依赖）并清理
-RUN pnpm install --frozen-lockfile && \
+RUN pnpm install --no-frozen-lockfile && \
     pnpm store prune
 
 # 复制源代码并构建
@@ -60,8 +60,6 @@ COPY --from=builder /app/packages/server/node_modules ./packages/server/node_mod
 
 # 从构建阶段复制 server bundle
 COPY --from=builder /app/packages/server/dist ./packages/server/dist
-# 复制本地预先构建的 UI 产物到同一目录
-COPY packages/ui/dist/. ./packages/server/dist/
 
 # 复制 PM2 配置文件
 COPY packages/server/ecosystem.config.cjs /app/
