@@ -1,6 +1,7 @@
 import { createHash } from "crypto";
 import { existsSync } from "fs";
 import { writeFile } from "fs/promises";
+import { Socket } from "net";
 import { homedir } from "os";
 import { join } from "path";
 import { initConfig, initDir } from "./utils";
@@ -66,6 +67,7 @@ interface PromptCacheEntry {
 
 interface PromptCacheDescriptor {
   cacheKey: string;
+  normalizedPrefixRequest: Record<string, any>;
   prefixHash: string;
   prefixRequest: Record<string, any>;
   ttlType: PromptCacheTTL;
@@ -80,6 +82,27 @@ interface PromptCacheCandidate extends PromptCacheDescriptor {
   snapshotIndex: number;
 }
 
+interface PromptCacheStoreCandidate {
+  descriptor: PromptCacheDescriptor;
+  prefixTokens: number;
+}
+
+interface ParsedRedisResponse {
+  error?: Error;
+  nextOffset: number;
+  value: any;
+}
+
+interface PromptCacheSessionPointer {
+  expiresAt: number;
+  key: string;
+  normalizedPrefixRequest: Record<string, any>;
+  prefixHash: string;
+  prefixTokens: number;
+  ttlType: PromptCacheTTL;
+  updatedAt: number;
+}
+
 interface PromptCacheUsage {
   inputTokens: number;
   cacheCreationInputTokens: number;
@@ -89,6 +112,8 @@ interface PromptCacheUsage {
   shouldStore: boolean;
   stored: boolean;
   descriptor?: PromptCacheDescriptor;
+  sessionPointer?: PromptCacheSessionPointer;
+  storeCandidates?: PromptCacheStoreCandidate[];
 }
 
 const PROMPT_CACHE_TTL_MS: Record<PromptCacheTTL, number> = {
@@ -96,10 +121,456 @@ const PROMPT_CACHE_TTL_MS: Record<PromptCacheTTL, number> = {
   "1h": 60 * 60 * 1000,
 };
 
-const promptCacheStore = new Map<string, PromptCacheEntry>();
+class PromptCacheRedisStore {
+  private readonly db: number;
+  private readonly host: string;
+  private readonly password: string;
+  private readonly port: number;
+  private readonly username: string;
+  private buffer = Buffer.alloc(0);
+  private commandChain = Promise.resolve();
+  private connectPromise: Promise<void> | null = null;
+  private pending: Array<{
+    reject: (error: Error) => void;
+    resolve: (value: any) => void;
+  }> = [];
+  private socket: Socket | null = null;
+
+  constructor(redisUrl: string) {
+    const parsed = new URL(redisUrl);
+    if (parsed.protocol !== "redis:") {
+      throw new Error(`unsupported prompt cache redis protocol: ${parsed.protocol}`);
+    }
+
+    this.host = parsed.hostname || "127.0.0.1";
+    this.port = Number(parsed.port || "6379");
+    this.username = decodeURIComponent(parsed.username || "");
+    this.password = decodeURIComponent(parsed.password || "");
+    this.db = Number(parsed.pathname.replace("/", "") || "0");
+  }
+
+  async get(cacheKey: string): Promise<PromptCacheEntry | null> {
+    const parsed = await this.getJSON(cacheKey);
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+
+    if (Number(parsed.expiresAt || 0) <= Date.now()) {
+      await this.sendCommand(["DEL", cacheKey]);
+      return null;
+    }
+
+    return {
+      key: String(parsed.key || cacheKey),
+      ttlType: parsed.ttlType === "1h" ? "1h" : "5m",
+      prefixTokens: Math.max(0, Math.round(Number(parsed.prefixTokens || 0))),
+      createdAt: Math.max(0, Math.round(Number(parsed.createdAt || 0))),
+      expiresAt: Math.max(0, Math.round(Number(parsed.expiresAt || 0))),
+    };
+  }
+
+  async ping(): Promise<void> {
+    await this.sendCommand(["PING"]);
+  }
+
+  async getJSON(cacheKey: string): Promise<any | null> {
+    const payload = await this.sendCommand(["GET", cacheKey]);
+    if (payload === null) {
+      return null;
+    }
+
+    return JSON.parse(String(payload));
+  }
+
+  async delete(cacheKey: string): Promise<void> {
+    await this.sendCommand(["DEL", cacheKey]);
+  }
+
+  async setJSON(cacheKey: string, value: Record<string, any>, ttlMs: number): Promise<void> {
+    await this.sendCommand([
+      "SET",
+      cacheKey,
+      JSON.stringify(value),
+      "PX",
+      String(Math.max(1, ttlMs)),
+    ]);
+  }
+
+  async setIfAbsent(entry: PromptCacheEntry): Promise<boolean> {
+    const payload = JSON.stringify(entry);
+    const ttlMs = Math.max(1, entry.expiresAt - Date.now());
+    const result = await this.sendCommand([
+      "SET",
+      entry.key,
+      payload,
+      "PX",
+      String(ttlMs),
+      "NX",
+    ]);
+    return result === "OK";
+  }
+
+  private async connect(): Promise<void> {
+    if (this.socket && !this.socket.destroyed) {
+      return;
+    }
+
+    if (this.connectPromise) {
+      return this.connectPromise;
+    }
+
+    this.connectPromise = new Promise<void>((resolve, reject) => {
+      const socket = new Socket();
+
+      const cleanupConnectHandlers = () => {
+        socket.removeListener("connect", handleConnect);
+        socket.removeListener("error", handleConnectError);
+      };
+
+      const handleConnect = async () => {
+        cleanupConnectHandlers();
+        this.socket = socket;
+        this.socket.setNoDelay(true);
+        this.socket.on("data", (chunk) => this.handleData(chunk));
+        this.socket.on("close", () => this.handleDisconnect(new Error("prompt cache redis connection closed")));
+        this.socket.on("error", (error) => this.handleDisconnect(error instanceof Error ? error : new Error(String(error))));
+
+        try {
+          if (this.password) {
+            if (this.username) {
+              await this.sendCommandDirect(["AUTH", this.username, this.password], true);
+            } else {
+              await this.sendCommandDirect(["AUTH", this.password], true);
+            }
+          }
+
+          if (this.db > 0) {
+            await this.sendCommandDirect(["SELECT", String(this.db)], true);
+          }
+
+          resolve();
+        } catch (error) {
+          socket.destroy();
+          reject(error);
+        }
+      };
+
+      const handleConnectError = (error: Error) => {
+        cleanupConnectHandlers();
+        reject(error);
+      };
+
+      socket.once("connect", handleConnect);
+      socket.once("error", handleConnectError);
+      socket.connect(this.port, this.host);
+    }).finally(() => {
+      this.connectPromise = null;
+    });
+
+    return this.connectPromise;
+  }
+
+  private encodeCommand(parts: string[]): Buffer {
+    const chunks: string[] = [`*${parts.length}\r\n`];
+    for (const part of parts) {
+      const byteLength = Buffer.byteLength(part);
+      chunks.push(`$${byteLength}\r\n${part}\r\n`);
+    }
+    return Buffer.from(chunks.join(""), "utf8");
+  }
+
+  private handleData(chunk: Buffer) {
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+    while (this.pending.length > 0) {
+      const parsed = this.parseResponse(this.buffer, 0);
+      if (!parsed) {
+        return;
+      }
+
+      this.buffer = this.buffer.subarray(parsed.nextOffset);
+      const pending = this.pending.shift();
+      if (!pending) {
+        return;
+      }
+
+      if (parsed.error) {
+        pending.reject(parsed.error);
+        continue;
+      }
+
+      pending.resolve(parsed.value);
+    }
+  }
+
+  private handleDisconnect(error: Error) {
+    this.socket = null;
+    this.buffer = Buffer.alloc(0);
+    while (this.pending.length > 0) {
+      const pending = this.pending.shift();
+      pending?.reject(error);
+    }
+  }
+
+  private parseResponse(buffer: Buffer, offset: number): ParsedRedisResponse | null {
+    if (buffer.length <= offset) {
+      return null;
+    }
+
+    const prefix = String.fromCharCode(buffer[offset]);
+    const lineEnd = buffer.indexOf("\r\n", offset);
+    if (lineEnd === -1) {
+      return null;
+    }
+
+    const line = buffer.toString("utf8", offset + 1, lineEnd);
+    const cursor = lineEnd + 2;
+
+    if (prefix === "+") {
+      return { nextOffset: cursor, value: line };
+    }
+
+    if (prefix === "-") {
+      return { error: new Error(line), nextOffset: cursor, value: null };
+    }
+
+    if (prefix === ":") {
+      return { nextOffset: cursor, value: Number(line) };
+    }
+
+    if (prefix === "$") {
+      const length = Number(line);
+      if (length === -1) {
+        return { nextOffset: cursor, value: null };
+      }
+
+      const end = cursor + length;
+      if (buffer.length < end + 2) {
+        return null;
+      }
+
+      return {
+        nextOffset: end + 2,
+        value: buffer.toString("utf8", cursor, end),
+      };
+    }
+
+    if (prefix === "*") {
+      const count = Number(line);
+      if (count === -1) {
+        return { nextOffset: cursor, value: null };
+      }
+
+      const values: any[] = [];
+      let nextOffset = cursor;
+      for (let index = 0; index < count; index += 1) {
+        const item = this.parseResponse(buffer, nextOffset);
+        if (!item) {
+          return null;
+        }
+        if (item.error) {
+          return item;
+        }
+        values.push(item.value);
+        nextOffset = item.nextOffset;
+      }
+
+      return { nextOffset, value: values };
+    }
+
+    throw new Error(`unsupported redis response prefix: ${prefix}`);
+  }
+
+  private async sendCommand(parts: string[]): Promise<any> {
+    const result = this.commandChain.then(() => this.sendCommandDirect(parts));
+    this.commandChain = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private async sendCommandDirect(parts: string[], assumeConnected = false): Promise<any> {
+    if (!assumeConnected) {
+      await this.connect();
+    }
+    const socket = this.socket;
+    if (!socket || socket.destroyed) {
+      throw new Error("prompt cache redis connection is not available");
+    }
+
+    return new Promise((resolve, reject) => {
+      this.pending.push({ resolve, reject });
+      socket.write(this.encodeCommand(parts));
+    });
+  }
+}
+
+let promptCacheStore: PromptCacheRedisStore | null = null;
 
 function cloneJSON<T>(value: T): T {
   return JSON.parse(JSON.stringify(value));
+}
+
+function normalizePromptCacheRequest(value: Record<string, any>): Record<string, any> {
+  const normalized = cloneJSON(value);
+
+  const stripCacheControl = (input: any): any => {
+    if (Array.isArray(input)) {
+      return input.map((item) => stripCacheControl(item));
+    }
+
+    if (!input || typeof input !== "object") {
+      return input;
+    }
+
+    const next: Record<string, any> = {};
+    for (const [key, item] of Object.entries(input)) {
+      if (key === "cache_control") {
+        continue;
+      }
+      next[key] = stripCacheControl(item);
+    }
+    return next;
+  };
+
+  const normalizeMessageContent = (message: any) => {
+    if (!message || typeof message !== "object") {
+      return;
+    }
+
+    if (typeof message.content === "string") {
+      return;
+    }
+
+    if (!Array.isArray(message.content) || message.content.length !== 1) {
+      return;
+    }
+
+    const [part] = message.content;
+    if (!part || typeof part !== "object" || part.type !== "text" || typeof part.text !== "string") {
+      return;
+    }
+
+    const partKeys = Object.keys(part).filter((key) => key !== "cache_control");
+    if (partKeys.length === 2 && partKeys.includes("type") && partKeys.includes("text")) {
+      message.content = part.text;
+    }
+  };
+
+  const normalizedWithoutCacheControl = stripCacheControl(normalized);
+
+  if (Array.isArray(normalizedWithoutCacheControl.system)) {
+    for (const block of normalizedWithoutCacheControl.system) {
+      if (!block || typeof block !== "object" || typeof block.text !== "string") {
+        continue;
+      }
+
+      if (!block.text.startsWith("x-anthropic-billing-header:")) {
+        continue;
+      }
+
+      block.text = block.text.replace(/cch=[^;]+/g, "cch=<normalized>");
+    }
+  }
+
+  if (Array.isArray(normalizedWithoutCacheControl.messages)) {
+    for (const message of normalizedWithoutCacheControl.messages) {
+      normalizeMessageContent(message);
+    }
+  }
+
+  return normalizedWithoutCacheControl;
+}
+
+function resolvePromptCacheSessionId(req: any): string {
+  if (typeof req?.sessionId === "string" && req.sessionId.length > 0) {
+    return req.sessionId;
+  }
+
+  const metadataUserId = req?.body?.metadata?.user_id;
+  if (typeof metadataUserId === "string" && metadataUserId.length > 0) {
+    try {
+      const parsed = JSON.parse(metadataUserId);
+      if (typeof parsed?.session_id === "string" && parsed.session_id.length > 0) {
+        return parsed.session_id;
+      }
+    } catch {}
+
+    const sessionMatch = metadataUserId.match(/"session_id"\s*:\s*"([^"]+)"/);
+    if (sessionMatch?.[1]) {
+      return sessionMatch[1];
+    }
+
+    const legacyMatch = metadataUserId.match(/_session_([a-f0-9-]+)/i);
+    if (legacyMatch?.[1]) {
+      return legacyMatch[1];
+    }
+  }
+
+  const headerValue = req?.headers?.session_id || req?.headers?.["session_id"];
+  if (typeof headerValue === "string" && headerValue.length > 0) {
+    return headerValue;
+  }
+
+  if (Array.isArray(headerValue) && typeof headerValue[0] === "string") {
+    return headerValue[0];
+  }
+
+  return "";
+}
+
+function buildPromptCacheSessionPointerKey(
+  sessionId: string,
+  modelName: string,
+  ttlType: PromptCacheTTL,
+): string {
+  return [
+    "prompt-cache-session",
+    modelName,
+    ttlType,
+    sessionId,
+  ].join(":");
+}
+
+function arePromptCacheValuesEqual(left: any, right: any): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function isPromptCacheArrayPrefix(prefix: any[], target: any[]): boolean {
+  if (prefix.length > target.length) {
+    return false;
+  }
+
+  for (let index = 0; index < prefix.length; index += 1) {
+    if (!arePromptCacheValuesEqual(prefix[index], target[index])) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function isPromptCacheRequestPrefix(
+  prefixRequest: Record<string, any>,
+  targetRequest: Record<string, any>,
+): boolean {
+  const prefixSystem = prefixRequest.system;
+  const targetSystem = targetRequest.system;
+
+  if (prefixSystem !== undefined) {
+    if (typeof prefixSystem === "string") {
+      if (prefixSystem !== targetSystem) {
+        return false;
+      }
+    } else if (Array.isArray(prefixSystem)) {
+      if (!Array.isArray(targetSystem) || !isPromptCacheArrayPrefix(prefixSystem, targetSystem)) {
+        return false;
+      }
+    } else if (!arePromptCacheValuesEqual(prefixSystem, targetSystem)) {
+      return false;
+    }
+  }
+
+  const prefixMessages = Array.isArray(prefixRequest.messages) ? prefixRequest.messages : [];
+  const targetMessages = Array.isArray(targetRequest.messages) ? targetRequest.messages : [];
+  return isPromptCacheArrayPrefix(prefixMessages, targetMessages);
 }
 
 function parsePromptCacheTTL(cacheControl: any): PromptCacheTTL {
@@ -201,7 +672,8 @@ function buildPromptCacheCandidates(requestBody: any): PromptCacheCandidate[] {
 
   const modelName = String(requestBody.model || "");
   return snapshots.map((snapshot, index) => {
-    const normalized = JSON.stringify(snapshot.request);
+    const normalizedRequest = normalizePromptCacheRequest(snapshot.request);
+    const normalized = JSON.stringify(normalizedRequest);
     const prefixHash = createHash("sha256").update(normalized).digest("hex");
     const cacheKey = [
       "prompt-cache",
@@ -212,6 +684,7 @@ function buildPromptCacheCandidates(requestBody: any): PromptCacheCandidate[] {
 
     return {
       cacheKey,
+      normalizedPrefixRequest: normalizedRequest,
       prefixHash,
       prefixRequest: snapshot.request,
       ttlType: snapshot.ttlType,
@@ -220,21 +693,49 @@ function buildPromptCacheCandidates(requestBody: any): PromptCacheCandidate[] {
   });
 }
 
-function getPromptCacheEntry(cacheKey: string): PromptCacheEntry | null {
-  const existing = promptCacheStore.get(cacheKey);
-  if (!existing) {
-    return null;
+async function getPromptCacheEntry(cacheKey: string): Promise<PromptCacheEntry | null> {
+  if (!promptCacheStore) {
+    throw new Error("prompt cache redis store is not initialized");
   }
 
-  if (existing.expiresAt <= Date.now()) {
-    promptCacheStore.delete(cacheKey);
-    return null;
-  }
-
-  return existing;
+  return promptCacheStore.get(cacheKey);
 }
 
-function storePromptCacheEntry(descriptor: PromptCacheDescriptor, prefixTokens: number): PromptCacheEntry {
+async function getPromptCacheSessionPointer(
+  sessionKey: string,
+): Promise<PromptCacheSessionPointer | null> {
+  if (!promptCacheStore) {
+    throw new Error("prompt cache redis store is not initialized");
+  }
+
+  const parsed = await promptCacheStore.getJSON(sessionKey);
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+
+  if (Number(parsed.expiresAt || 0) <= Date.now()) {
+    await promptCacheStore.delete(sessionKey);
+    return null;
+  }
+
+  return {
+    expiresAt: Math.max(0, Math.round(Number(parsed.expiresAt || 0))),
+    key: String(parsed.key || sessionKey),
+    normalizedPrefixRequest: parsed.normalizedPrefixRequest && typeof parsed.normalizedPrefixRequest === "object"
+      ? parsed.normalizedPrefixRequest
+      : { messages: [] },
+    prefixHash: String(parsed.prefixHash || ""),
+    prefixTokens: Math.max(0, Math.round(Number(parsed.prefixTokens || 0))),
+    ttlType: parsed.ttlType === "1h" ? "1h" : "5m",
+    updatedAt: Math.max(0, Math.round(Number(parsed.updatedAt || 0))),
+  };
+}
+
+async function storePromptCacheEntry(descriptor: PromptCacheDescriptor, prefixTokens: number): Promise<PromptCacheEntry> {
+  if (!promptCacheStore) {
+    throw new Error("prompt cache redis store is not initialized");
+  }
+
   const now = Date.now();
   const entry: PromptCacheEntry = {
     key: descriptor.cacheKey,
@@ -243,8 +744,20 @@ function storePromptCacheEntry(descriptor: PromptCacheDescriptor, prefixTokens: 
     createdAt: now,
     expiresAt: now + PROMPT_CACHE_TTL_MS[descriptor.ttlType],
   };
-  promptCacheStore.set(descriptor.cacheKey, entry);
+  await promptCacheStore.setIfAbsent(entry);
   return entry;
+}
+
+async function storePromptCacheSessionPointer(pointer: PromptCacheSessionPointer): Promise<void> {
+  if (!promptCacheStore) {
+    throw new Error("prompt cache redis store is not initialized");
+  }
+
+  await promptCacheStore.setJSON(
+    pointer.key,
+    pointer,
+    Math.max(1, pointer.expiresAt - Date.now()),
+  );
 }
 
 function buildPromptCacheUsage(inputTokens: number, cacheUsage: PromptCacheUsage) {
@@ -295,7 +808,7 @@ async function resolvePromptCacheUsage(
       return {
         candidate,
         prefixTokens,
-        existing: getPromptCacheEntry(candidate.cacheKey),
+        existing: await getPromptCacheEntry(candidate.cacheKey),
       };
     }),
   );
@@ -303,6 +816,13 @@ async function resolvePromptCacheUsage(
   const finalCandidate = tokenizedCandidates[tokenizedCandidates.length - 1];
   const descriptor = finalCandidate.candidate;
   const prefixTokens = finalCandidate.prefixTokens;
+  const sessionId = resolvePromptCacheSessionId(req);
+  const sessionPointerKey = sessionId
+    ? buildPromptCacheSessionPointerKey(sessionId, String(req.body?.model || ""), descriptor.ttlType)
+    : "";
+  const sessionPointer = sessionPointerKey
+    ? await getPromptCacheSessionPointer(sessionPointerKey)
+    : null;
 
   if (prefixTokens <= 0) {
     return {
@@ -313,15 +833,33 @@ async function resolvePromptCacheUsage(
       cacheCreation1hTokens: 0,
       shouldStore: false,
       stored: false,
+      sessionPointer: undefined,
     };
   }
 
   const bestReusableCandidate = tokenizedCandidates
     .filter((item) => item.existing && item.prefixTokens > 0)
     .sort((left, right) => right.prefixTokens - left.prefixTokens)[0];
-  const reusablePrefixTokens = bestReusableCandidate?.prefixTokens || 0;
+  const explicitReusablePrefixTokens = bestReusableCandidate?.prefixTokens || 0;
+  const sessionReusablePrefixTokens = sessionPointer &&
+    isPromptCacheRequestPrefix(
+      sessionPointer.normalizedPrefixRequest,
+      descriptor.normalizedPrefixRequest,
+    )
+    ? Math.min(prefixTokens, sessionPointer.prefixTokens)
+    : 0;
+  const reusablePrefixTokens = Math.max(
+    explicitReusablePrefixTokens,
+    sessionReusablePrefixTokens,
+  );
   const nonCachedInputTokens = Math.max(0, totalInputTokens - prefixTokens);
   const cacheCreationInputTokens = Math.max(0, prefixTokens - reusablePrefixTokens);
+  const storeCandidates = tokenizedCandidates
+    .filter((item) => !item.existing && item.prefixTokens > reusablePrefixTokens)
+    .map((item) => ({
+      descriptor: item.candidate,
+      prefixTokens: item.prefixTokens,
+    }));
 
   if (bestReusableCandidate && reusablePrefixTokens >= prefixTokens) {
     return {
@@ -333,6 +871,18 @@ async function resolvePromptCacheUsage(
       shouldStore: false,
       stored: true,
       descriptor,
+      sessionPointer: sessionPointerKey
+        ? {
+            key: sessionPointerKey,
+            ttlType: descriptor.ttlType,
+            prefixHash: descriptor.prefixHash,
+            prefixTokens,
+            normalizedPrefixRequest: descriptor.normalizedPrefixRequest,
+            updatedAt: Date.now(),
+            expiresAt: Date.now() + PROMPT_CACHE_TTL_MS[descriptor.ttlType],
+          }
+        : undefined,
+      storeCandidates: [],
     };
   }
 
@@ -342,19 +892,41 @@ async function resolvePromptCacheUsage(
     cacheReadInputTokens: reusablePrefixTokens,
     cacheCreation5mTokens: descriptor.ttlType === "5m" ? cacheCreationInputTokens : 0,
     cacheCreation1hTokens: descriptor.ttlType === "1h" ? cacheCreationInputTokens : 0,
-    shouldStore: true,
+    shouldStore: storeCandidates.length > 0,
     stored: false,
     descriptor,
+    sessionPointer: sessionPointerKey
+      ? {
+          key: sessionPointerKey,
+          ttlType: descriptor.ttlType,
+          prefixHash: descriptor.prefixHash,
+          prefixTokens,
+          normalizedPrefixRequest: descriptor.normalizedPrefixRequest,
+          updatedAt: Date.now(),
+          expiresAt: Date.now() + PROMPT_CACHE_TTL_MS[descriptor.ttlType],
+        }
+      : undefined,
+    storeCandidates,
   };
 }
 
-function ensurePromptCacheStored(cacheUsage: PromptCacheUsage) {
-  if (!cacheUsage.shouldStore || cacheUsage.stored || !cacheUsage.descriptor) {
+async function ensurePromptCacheStored(cacheUsage: PromptCacheUsage) {
+  if (!cacheUsage.shouldStore || cacheUsage.stored || !cacheUsage.storeCandidates?.length) {
     return;
   }
 
-  storePromptCacheEntry(cacheUsage.descriptor, cacheUsage.cacheCreationInputTokens);
+  for (const candidate of cacheUsage.storeCandidates) {
+    await storePromptCacheEntry(candidate.descriptor, candidate.prefixTokens);
+  }
   cacheUsage.stored = true;
+}
+
+async function ensurePromptCacheSessionPointerStored(cacheUsage: PromptCacheUsage) {
+  if (!cacheUsage.sessionPointer) {
+    return;
+  }
+
+  await storePromptCacheSessionPointer(cacheUsage.sessionPointer);
 }
 
 function hasAnthropicUsage(usage: any): boolean {
@@ -516,6 +1088,14 @@ async function getServer(options: RunOptions = {}) {
   const servicePort = process.env.SERVICE_PORT
     ? parseInt(process.env.SERVICE_PORT)
     : port;
+  const promptCacheRedisUrl = process.env.PROMPT_CACHE_REDIS_URL;
+
+  if (!promptCacheRedisUrl) {
+    throw new Error("PROMPT_CACHE_REDIS_URL is required");
+  }
+
+  promptCacheStore = new PromptCacheRedisStore(promptCacheRedisUrl);
+  await promptCacheStore.ping();
 
   // Configure logger based on config settings or external options
   const pad = (num: number) => (num > 9 ? "" : "0") + num;
@@ -837,7 +1417,8 @@ async function getServer(options: RunOptions = {}) {
       if (payload && typeof payload === "object" && !payload.error) {
         const promptCacheUsage = await promptCacheUsagePromise;
         if (!hasAnthropicUsage(payload.usage)) {
-          ensurePromptCacheStored(promptCacheUsage);
+          await ensurePromptCacheStored(promptCacheUsage);
+          await ensurePromptCacheSessionPointerStored(promptCacheUsage);
           payload.usage = buildAnthropicUsage(
             promptCacheUsage.inputTokens,
             Number(payload.usage?.output_tokens || 0),
@@ -860,7 +1441,8 @@ async function getServer(options: RunOptions = {}) {
 
         if (eventData?.event === "message_start") {
           const promptCacheUsage = await promptCacheUsagePromise;
-          ensurePromptCacheStored(promptCacheUsage);
+          await ensurePromptCacheStored(promptCacheUsage);
+          await ensurePromptCacheSessionPointerStored(promptCacheUsage);
           const originalUsage = eventData?.data?.message?.usage || {};
           eventData.data.message.usage = {
             ...buildAnthropicUsage(promptCacheUsage.inputTokens, 0, promptCacheUsage),
@@ -881,7 +1463,8 @@ async function getServer(options: RunOptions = {}) {
               ],
             });
 
-            ensurePromptCacheStored(promptCacheUsage);
+            await ensurePromptCacheStored(promptCacheUsage);
+            await ensurePromptCacheSessionPointerStored(promptCacheUsage);
             usagePatched = true;
             return {
               ...eventData,
@@ -911,7 +1494,8 @@ async function getServer(options: RunOptions = {}) {
             ],
           });
 
-          ensurePromptCacheStored(promptCacheUsage);
+          await ensurePromptCacheStored(promptCacheUsage);
+          await ensurePromptCacheSessionPointerStored(promptCacheUsage);
           (controller as any).enqueue({
             event: "message_delta",
             data: {
